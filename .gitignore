@@ -1,0 +1,17 @@
+.venv/
+.env
+seen.json
+profile.json
+last_top.json
+papers_store.json
+labels.json
+scores_cache.json
+deepread_cache.json
+速报_*.md
+待核对清单.md
+核对详情.md
+待标注清单.md
+__pycache__/
+随机核对.md
+agent专家修改建议.md
+修改记录.md
