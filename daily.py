@@ -13,9 +13,11 @@ client = OpenAI(
     base_url="https://api.deepseek.com",  # DeepSeek 用 OpenAI 兼容接口
 )
 
-def chat(prompt, temperature=0, model="deepseek-chat", retries=3, timeout=60):
+def chat(prompt, temperature=0, model="deepseek-chat", retries=3, timeout=60, json_mode=False):
     """统一的 LLM 调用入口:带超时 + 指数退避重试。
-    全项目的 DeepSeek 调用都走这里,网络抖动/限流不再让整条 graph 崩。"""
+    全项目的 DeepSeek 调用都走这里,网络抖动/限流不再让整条 graph 崩。
+    json_mode=True 走 DeepSeek 的 json_object 输出(要求 prompt 里出现 "json" 字样)。"""
+    extra = {"response_format": {"type": "json_object"}} if json_mode else {}
     for i in range(retries):
         try:
             resp = client.chat.completions.create(
@@ -23,6 +25,7 @@ def chat(prompt, temperature=0, model="deepseek-chat", retries=3, timeout=60):
                 temperature=temperature,
                 timeout=timeout,
                 messages=[{"role": "user", "content": prompt}],
+                **extra,
             )
             return resp.choices[0].message.content
         except Exception as e:

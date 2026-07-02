@@ -13,6 +13,8 @@ CACHE_FILE = Path(__file__).parent / "scores_cache.json"
 
 TOP_K = 5            # 最终精选几篇
 BATCH = 8            # 每次塞给 LLM 打分的论文数(批量)
+LLM_CAND = 30        # 召回截断:只对召回 top-30 送 LLM 打分。首轮抓 30 篇时不生效,
+                     # widen 重抓 60/90 篇时漏斗才体现(打分成本不随抓取量线性涨)
 RELEVANT_THRESHOLD = 7  # 打分 >= 几分算"相关"(graph 路由与 eval 一致性都引用它,单一来源)
 PREF_WEIGHT = 3.0    # 偏好重排强度:把与 liked/disliked 的相似度差折算成打分加减
                      # tune.py 扫描(180库/25rel):权重0~3 P@10=1.00、5~8 掉到0.90 → 高权重有害,
@@ -80,6 +82,7 @@ def hybrid_recall(interest, papers, bg_texts=None):
     fused, _ = rrf([e_ranked, b_ranked])
     return fused
 
+# 曾迁移 json_object 单对象模式,离线评测显示一致率 0.89→0.82、重排增益消失,故回退;json_mode 仅保留在 reflect
 def _score_batch(interest, batch):
     """让 LLM 给一批论文逐篇打分。返回 ([(score, reason), ...], 是否检出异常)。
     异常 = 模型漏条/多条/错位 id,留给上层 _score_batch_safe 决定重打。"""
@@ -201,8 +204,12 @@ def rank_papers(interest, papers, top_k=TOP_K, use_memory=False, bg_texts=None):
     """阶段B总入口:混合检索召回 → LLM打分+一致性校验 →(可选)偏好重排 → 选 top-K。
     返回 [(paper, score, reason), ...] 按分数降序;score 仍是 LLM 原始相关度,偏好只影响排序。"""
     recalled = hybrid_recall(interest, papers, bg_texts)  # RRF 融合的召回顺序
-    cand = [papers[i] for i in recalled]                  # 按召回顺序排好的候选
+    cand = [papers[i] for i in recalled[:LLM_CAND]]       # 召回截断:只精排头部候选
     scores, hallu = llm_score(interest, cand)             # LLM 逐篇打分
+    if hallu:
+        # 分数不可靠时不按坏分数排,退回混合召回顺序 —— 检索排序不依赖 LLM
+        top = [(p, s, "打分失效,按检索排序") for p, (s, _) in zip(cand[:top_k], scores)]
+        return top, hallu
     bonus = preference_bonus(cand) if use_memory else [0.0] * len(cand)
     ranked = sorted(zip(cand, scores, bonus), key=lambda x: x[1][0] + x[2], reverse=True)
     top = [(p, s, r) for p, (s, r), _ in ranked[:top_k]]

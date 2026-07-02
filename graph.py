@@ -50,6 +50,10 @@ def rank_node(state: State):
 
 # 条件边1:相关够 / 抓够轮数 → 出报告;否则进反思
 def decide(state: State):
+    if state["hallu"]:
+        # 打分失效时 relevant_count 基于坏分数,反思会被误导 → 直接出报告(头部已标注异常)
+        print("[decide] 打分校验异常 → 跳过反思,直接出速报")
+        return "report"
     if state["relevant_count"] < MIN_RELEVANT and state["attempts"] < MAX_ATTEMPTS:
         print(f"[decide] 相关仅 {state['relevant_count']} 篇 < {MIN_RELEVANT} → 反思")
         return "reflect"
@@ -71,16 +75,23 @@ def reflect_node(state: State):
         '"new_categories":["<若 widen,给要补充的 arxiv 分类如 cs.CL>"],'
         '"why":"<一句中文理由>"}'
     )
-    text = chat(prompt, temperature=0)
-    m = re.search(r"\{.*\}", text, re.S)
-    obj = json.loads(m.group()) if m else {"action": "stop", "why": "决策解析失败,停止"}
+    text = chat(prompt, temperature=0, json_mode=True)
+    try:
+        obj = json.loads(text)
+    except Exception:
+        obj = {"action": "stop", "why": "决策解析失败,停止"}
     action = obj.get("action", "stop")
     print(f"[reflect] 决策={action} —— {obj.get('why', '')}")
     out = {"action": action}
     if action == "refocus" and obj.get("new_query"):
         out["query"] = obj["new_query"]
-    if action == "widen" and obj.get("new_categories"):
-        out["extra_cats"] = sorted(set(state.get("extra_cats", []) + obj["new_categories"]))
+    if action == "widen":
+        # 白名单校验:LLM 给的分类要拼进 arxiv query,只放行 cs.CL/stat.ML 这类合法格式
+        cats = [c for c in obj.get("new_categories", []) if re.fullmatch(r"[a-z-]+\.[A-Z]{2}", str(c))]
+        if cats:
+            out["extra_cats"] = sorted(set(state.get("extra_cats", []) + cats))
+        else:
+            out["action"] = "stop"  # 全部不合法,widen 无从执行
     return out
 
 # 条件边2:按反思动作路由 —— stop 去报告,widen/refocus 回去重抓
@@ -94,7 +105,7 @@ def report_node(state: State):
     today = date.today().isoformat()
     lines = [
         f"# arxiv 速报 · {today}",
-        f"\n方向:{', '.join(CATEGORIES + state.get('extra_cats', []))} | 精选 {len(top)} 篇 | "
+        f"\n方向:{', '.join(dict.fromkeys(CATEGORIES + state.get('extra_cats', [])))} | 精选 {len(top)} 篇 | "
         f"打分校验:{'异常(本期打分仅供参考)' if hallu else '通过'}\n",
     ]
     for i, (p, score, reason) in enumerate(top, 1):

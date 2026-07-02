@@ -2,7 +2,7 @@ import random
 from types import SimpleNamespace
 
 from qa import load_store
-from retrieval import INTEREST, RELEVANT_THRESHOLD, hybrid_recall, llm_score, preference_bonus
+from retrieval import INTEREST, RELEVANT_THRESHOLD, bm25_recall, embed_recall, hybrid_recall, llm_score, preference_bonus
 from label import load_labels
 from memory import get_anchor_ids
 
@@ -36,8 +36,11 @@ if __name__ == "__main__":
     papers = [to_paper(r) for r in store if r["id"] not in anchors]
     feedback_n = len([1 for r in store if r["id"] in anchors])
 
-    # 只打一次分,记忆开/关共用同一组分数;唯一差别是偏好重排 bonus → LLM 打分噪声在对比中抵消
+    # 消融各级排序:BM25/向量/RRF 全是本地计算零 API;LLM 打分走 scores_cache 复用
+    b_ranked, _ = bm25_recall(INTEREST, papers)
+    e_ranked, _ = embed_recall(INTEREST, papers)
     cand = [papers[i] for i in hybrid_recall(INTEREST, papers)]
+    # 只打一次分,记忆开/关共用同一组分数;唯一差别是偏好重排 bonus → LLM 打分噪声在对比中抵消
     scores, _ = llm_score(INTEREST, cand)
     bonus = preference_bonus(cand)
     off = [p for p, _ in sorted(zip(cand, scores), key=lambda x: x[1][0], reverse=True)]
@@ -48,9 +51,15 @@ if __name__ == "__main__":
     rand = cand[:]
     rng.shuffle(rand)
 
-    p_off, r_off, cov = metric(off, labels)
-    p_on, r_on, _ = metric(on, labels)
-    p_rand, r_rand, _ = metric(rand, labels)
+    ablation = [
+        ("随机基线", rand),
+        ("纯 BM25", [papers[i] for i in b_ranked]),
+        ("纯向量", [papers[i] for i in e_ranked]),
+        ("混合 RRF", cand),
+        ("混合+LLM打分(记忆关)", off),
+        ("混合+LLM+记忆(开)", on),
+    ]
+    _, _, cov = metric(off, labels)
 
     # 一致性:LLM 打分≥阈值 与 人工 rel 标签 的吻合率,验证"7 分阈值"是否靠谱(P2-H)
     agree = total = 0
@@ -62,8 +71,9 @@ if __name__ == "__main__":
 
     print(f"评测口径:标注 {len(labels)} 篇 / 反馈 {feedback_n} 条(已从测试集排除)/ "
           f"测试集 {len(papers)} 篇 / top-{K} 中已标注 {cov} 篇")
-    print("⚠ 标注为 LLM-as-a-judge 银标签、反馈样本小,数字仅供横向对比参考\n")
-    print(f"随机基线:          Precision@{K}={p_rand:.2f}  Recall@{K}={r_rand:.2f}")
-    print(f"记忆关(基础画像):  Precision@{K}={p_off:.2f}  Recall@{K}={r_off:.2f}")
-    print(f"记忆开(反馈更新后):Precision@{K}={p_on:.2f}  Recall@{K}={r_on:.2f}")
+    print("注意:标注为 LLM-as-a-judge 银标签、反馈样本小,数字仅供横向对比参考\n")
+    print(f"{'排序方案':<24}Precision@{K}  Recall@{K}")
+    for name, ranked in ablation:
+        p, r, _ = metric(ranked, labels)
+        print(f"{name:<24}{p:>12.2f}{r:>10.2f}")
     print(f"\nLLM≥{RELEVANT_THRESHOLD}分 与人工 rel 标签一致率:{consistency:.2f}(共 {total} 篇有标签)")

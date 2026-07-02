@@ -46,6 +46,16 @@ def test_score_batch_detects_out_of_range_id(monkeypatch):
     _, bad = _score_batch("interest", [_paper(), _paper()])
     assert bad is True
 
+def test_rank_papers_degrades_on_hallu(monkeypatch):
+    # 打分失效时应按混合召回顺序取 top-K,不按坏分数排
+    papers = [_paper(t=f"p{i}") for i in range(3)]
+    monkeypatch.setattr(retrieval, "hybrid_recall", lambda *a, **k: [2, 0, 1])
+    monkeypatch.setattr(retrieval, "llm_score", lambda *a, **k: ([(9, "x"), (1, "y"), (5, "z")], True))
+    top, hallu = retrieval.rank_papers("i", papers, top_k=2)
+    assert hallu is True
+    assert [p.title for p, _, _ in top] == ["p2", "p0"]
+    assert top[0][2] == "打分失效,按检索排序"
+
 def test_metric_precision():
     # top-10 里 4 篇 rel → Precision@10 == 0.4
     ranked = [SimpleNamespace(entry_id=str(i)) for i in range(10)]
