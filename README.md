@@ -1,129 +1,254 @@
-# 论文追踪速读 Agent
+# arXiv 论文追踪 Agent
 
-> 给定研究兴趣，每天自动抓取 arxiv 新论文 → 混合检索 + LLM 打分筛出最相关的几篇 → 多步精读生成中文速报；支持论文库 RAG 问答与偏好反馈记忆。全流程用 LangGraph 编排，含"相关不足→自主反思→调整重抓"的 agent 决策闭环，并附一套去泄漏的离线评测。
+一个面向 LLM Agent / RAG 研究方向的摘要级论文筛选工作流：增量抓取 arXiv 新论文，用混合检索和 LLM 精排生成中文速报，并在相关结果不足时由 LangGraph 节点在受控动作空间内反思与路由。
 
-面向场景：AI 方向学生/研究者每天面对数百篇 arxiv 新论文，人工筛选成本高。本项目把"让 LLM 直接筛论文"做成**可量化、防瞎编、越用越准**的推荐流水线。
+> 能力边界：项目只使用 arXiv 标题和摘要，没有读取 PDF 全文；`graph.py` 是单次运行入口，不自带定时调度器。偏好反馈会被记录，但当前仅有 3 个 anchor，生产偏好权重保守设为 `0.0`，不宣称系统已经“越用越准”。
 
----
+## 30 秒查看项目
 
-## 架构
-
-```
-              研究兴趣画像(关键词 + 反馈历史)
-                          │
-   ┌──────────────── LangGraph StateGraph ────────────────┐
-   │                                                       │
- [fetch] 抓 arxiv 新论文(按分类, entry_id 去重)            │
-   │                                                       │
- [rank]  混合检索召回: 向量(embedding) + 关键词(BM25)       │
-   │      ──RRF 融合,截断 top-30──▶ LLM 打分+一致性校验     │
-   │      (校验失败 → 降级按检索排序出报告)                 │
-   │      ──(可选)向量空间偏好重排──▶ top-K                 │
-   │                                                       │
- [decide] 相关篇数够? ──否──▶ [reflect] LLM 诊断原因,       │
-   │            │              自主选 widen/refocus/stop ──┘
-   │            └──是──▶
- [report] top-K 多步精读(贡献/方法/相关点) → 中文速报
-   │
-   ├─▶ 论文入本地库  ──▶ [RAG 问答] 检索片段→基于片段作答+标出处
-   └─▶ 偏好反馈(有用/没用) ──▶ 更新画像(同时作为评测标签)
-```
-
-**为什么算 agent 而非脚本**：`reflect` 节点在运行时根据"相关论文不足"这一观察，让 LLM **自主诊断**并在 `widen`(扩大 arxiv 分类) / `refocus`(收窄兴趣 query) / `stop`(今日无好论文) 三种动作间动态路由，而非跑固定 DAG。这是"运行时自主选择下一步动作"的 agent 本质。
-
----
-
-## 核心技术点
-
-| 模块 | 技术 | 说明 |
-|---|---|---|
-| 编排 | **LangGraph StateGraph** | 节点 + 共享 State + 条件边，支撑反思-重抓循环 |
-| 召回 | **混合检索 (embedding + BM25 + RRF)** | 语义召回 + 关键词召回，RRF 融合，单路短板互补 |
-| 精排 | **LLM 打分 + 一致性校验** | 只精排召回 top-30；回填编号检测漏条/错位/越界，检出即重打，仍失败降级为纯检索排序出报告 |
-| 记忆 | **向量空间偏好重排** | 与 liked 相似加分、disliked 减分；不污染原始 query |
-| 问答 | **RAG (检索增强生成)** | 检索片段→基于片段作答→标出处→相似度阈值兜底防瞎编 |
-| 评测 | **离线评测 (Precision/Recall@K)** | 银标签+人工校准、随机基线、anchor 排除防泄漏 |
-| 安全 | **Prompt 注入加固** | 外部文本用分隔符包裹 + 声明"数据非指令" |
-
----
-
-## 评测结果
-
-数据集：180 篇论文库，104 篇人工校准标注（25 相关 / 79 不相关），测试集 177 篇（排除 3 条反馈 anchor）。
-
-| 排序方案 | Precision@10 | Recall@10 |
-|---|---|---|
-| 随机基线 | 0.20 | 0.08 |
-| 纯 BM25 | 0.90 | 0.36 |
-| 纯向量 | 0.60 | 0.24 |
-| 混合 RRF | 0.90 | 0.36 |
-| 混合+LLM打分(记忆关) | 1.00 | 0.40 |
-| 混合+LLM+记忆(开) | **1.00** | **0.40** |
-
-- **混合检索(RRF)Recall@10 = 0.36，LLM 重排后 0.40**（top-10 全为相关，顶到窗口上限），随机基线仅 0.08。
-- 消融结论：**混合召回主要由 BM25 支撑**（纯 BM25 与 RRF 持平，纯向量明显更弱），**LLM 打分贡献最后一档提升**（0.36→0.40）。
-- **LLM 打分与人工标签一致率 0.89**（102 篇），验证相关性阈值可靠。
-- 随机抽 18 篇独立标注、0 篇相关 → 相关论文基率约 10%，反衬检索"大海捞针"价值。
-
-**方法学诚实声明**：标注为 LLM-as-a-judge 银标签经人工抽检校准；P@10=1.00 因相关标注集中在检索高排名论文存在选择偏差，故以受偏差影响更小的 **Recall@10** 为主指标。偏好记忆在当前 3 条反馈下无定量增益，定位为定性功能（tune 扫描显示偏好权重过高反而有害，已据此从 5.0 调至 3.0）。
-
----
-
-## 安装与运行
+安装依赖后，以下四条命令分别展示输出语义、工程测试、公开证据完整性和 Agent 路由契约：
 
 ```bash
-# 1. 环境
-python -m venv .venv
-.venv\Scripts\activate          # Windows;  Linux/Mac: source .venv/bin/activate
-pip install -r requirements.txt
-
-# 2. 配置 LLM(DeepSeek, OpenAI 兼容接口)
-echo DEEPSEEK_API_KEY=sk-xxxx > .env
-
-# 3. 跑一次:出当天中文速报
-python graph.py                 # 产物: 速报_日期.md
-
-# 4. 反馈记忆: 对速报第 n 篇点有用/没用
-python feedback.py 1 up
-python feedback.py 3 down
-
-# 5. RAG 问答
-python qa.py "论文库里有哪些关于强化学习的研究?"
-
-# 6. 评测
-python label.py                 # 看标注清单
-python label.py rel 1 5 8       # 批量标相关
-python eval.py                  # 出 Precision/Recall@10 + 随机基线 + 一致率
-python tune.py                  # 扫描偏好权重取最优
-
-# 7. 单元测试
-pytest test_retrieval.py
+python graph.py --demo
+DEEPSEEK_API_KEY= python -m pytest -q
+python scripts/export_eval_snapshot.py --verify-only
+DEEPSEEK_API_KEY= python agent_eval.py
 ```
 
----
+- `--demo` 使用固定 fixture，不需 API key、不联网、不写入本地运行数据。
+- 单元测试覆盖混合检索、LLM 返回校验与降级、Agent 路由、抓取水位、反馈反转、QA 引用检查和评测口径；CI 也在无 key 环境运行全量 `pytest`。
+- 冻结证据包可在没有个人 profile 和运行态 JSON 的公开仓库中独立校验。
+- Agent 情景评测默认注入冻结决策，不调用模型；故障样本会实际经过生产 parser、validator 和 route。
 
-## 文件说明
+一份不声称读过全文的速报展示见 [examples/report_sample.md](examples/report_sample.md)。
 
-| 文件 | 职责 |
+## 工作流
+
+```mermaid
+flowchart TD
+    A["fetch：增量 arXiv 窗口"] --> B["rank：FastEmbed + BM25 + RRF"]
+    B --> C["RRF top-30 送 LLM 相关性打分"]
+    C --> D{"schema / id / 条数校验通过？"}
+    D -- "否" --> E["降级为 RRF 排序，不形成正式推荐"]
+    D -- "是" --> F{"达标论文足够？"}
+    F -- "是" --> G["report：摘要级结构化速读"]
+    F -- "否" --> H["reflect：受控决策"]
+    H -- "widen" --> A
+    H -- "refocus" --> B
+    H -- "stop" --> G
+    E --> G
+    G --> I["原子写入速报 / 摘要库 / seen / 水位"]
+    I --> J["摘要库 QA：检索、相似度门槛、引用校验"]
+    I --> K["反馈：当前标签 + 追加式事件历史"]
+```
+
+`reflect` 不是无约束的“自主 Agent”。它只能选择 `widen` / `refocus` / `stop`，新 arXiv 分类必须命中显式白名单，新 query 需通过语言、长度和变化检查，同时受抓取轮数和反思次数限制。这里展示的是“LLM 决策 + 确定性约束 + 失败降级”的 Agent 工程思路。
+
+## 工程要点
+
+| 问题 | 实现 |
 |---|---|
-| `graph.py` | **主入口**。LangGraph 编排：fetch→rank→(reflect)→report |
-| `daily.py` | arxiv 抓取、去重、统一 LLM 调用封装(超时+重试) |
-| `retrieval.py` | 混合检索、LLM 打分+一致性校验、偏好重排、多步精读 |
-| `memory.py` | 偏好画像读写、反馈记录、评测锚点 |
-| `qa.py` | RAG 问答 + 本地论文库 |
-| `feedback.py` | CLI：对速报打"有用/没用"标签 |
-| `label.py` / `eval.py` / `tune.py` | 评测：标注 / 消融表+一致率 / 调参 |
-| `review_list.py` / `random_check.py` | 评测辅助：生成待核对清单 / 随机抽样核对 |
-| `test_retrieval.py` | 单元测试(rrf / tokenize / 一致性校验 / 打分降级 / metric) |
+| 新论文会被 top-N 抓取永久漏掉 | 按 UTC 提交时间窗口分页抓取；首次回看 7 天，之后从成功水位回退 15 分钟，用规范化 arXiv ID 去重 |
+| 语义检索和字面匹配各有盲区 | 多语种 FastEmbed 向量召回 + BM25 关键词召回，通过 RRF 融合 |
+| 抓取量增大时 LLM 费用线性增长 | 先召回，只对 RRF top-30 做 DeepSeek 打分；合法结果用版本化内容指纹缓存 |
+| LLM 漏条、错位或返回脏数据 | 要求回填 `id`，严格检查 JSONL 字段集、类型、0–10 整数范围、唯一 ID 和完整条数；整批重打后仍异常则回退 RRF，异常占位不入缓存 |
+| arXiv 文本包含 Prompt Injection | 标题/摘要用 JSON 数据边界封装，打分、摘要速读和反思均有 system 约束；动作和分类再做程序白名单验证 |
+| 中途崩溃损坏 JSON 或跳过抓取窗口 | 文本/JSON 通过同目录临时文件 + `fsync` + `os.replace` 原子替换；关键 read-modify-write 还使用文件锁；只在报告和状态完整落盘后推进抓取水位 |
+| Agent 动作难解释、难与固定策略比较 | 速报保留 action / source / reason 决策轨迹；12 个合成场景直接复用生产反思节点，并报告 always-widen / always-stop 基线 |
+| 反馈标签反转后同时出现在 liked/disliked | 同一论文只保留一个当前状态，同时在 `feedback_events` 保留追加式审计历史 |
+| 摘要库 QA 强行作答 | 对每个候选单独过相似度门槛；没有证据则拒答，生成后再检查引用编号是否存在且越界 |
 
----
+## 安装
 
-## 设计选型与取舍
+推荐 Python 3.13（CI 使用该版本）：
 
-- **为什么混合检索而非单一召回**：embedding 懂语义但会被字面词误导（如标题含 "memory" 实则讲 RL 内存优化），BM25 懂关键词但不懂同义，二者用 RRF 融合互补。
-- **为什么偏好重排放在向量空间**：不把历史论文标题塞回检索 query——因为 embedding 不懂否定（"不喜欢"会被当成"相关"），且长文本注入会带偏 query；改为打分后按相似度加减分，方向明确且不污染召回。
-- **为什么用 LangGraph**：reflect 的"诊断→重抓"是带条件分支与回环的控制流，状态图比顺序函数更清晰，也是 agent 工程的高频实践。
-- **为什么 LLM 选 DeepSeek**：中文友好、OpenAI 兼容接口可零成本迁移、价格低适合大量打分；打分 `temperature=0` + 结果缓存保证评测可复现。
-- **为什么砍掉 FastAPI/Docker 部署**：当前定位是"可讲透的最小可用闭环"，部署是一天可补的工程外壳，优先把 agent 决策与评测做扎实。
-- **评测为什么用银标签 + 人工校准**：无人工金标准时，先用 LLM 代标快速起步，再人工抽检校准并随机采样去偏，诚实交代局限优于伪造金标准。
-- **为什么打分不用 json_object 模式**：曾迁移到单对象 structured output，离线评测拦截到校准回归（与人工标签一致率 0.89→0.82、LLM 重排增益消失），数据驱动回退——打分保留"每行一个 JSON + id 回填一致性校验"，json_mode 仅用于 reflect 决策解析。
+```bash
+python3 -m venv .venv
+source .venv/bin/activate                 # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
+```
+
+FastEmbed 模型 `paraphrase-multilingual-MiniLM-L12-v2` 不包含在仓库中。第一次真正运行向量检索时会联网下载约 **0.22–0.24 GB** 到本机缓存；之后可复用。`graph.py --demo` 不会触发该下载。
+
+## 运行方式
+
+### 1. 纯离线 demo
+
+```bash
+python graph.py --demo
+```
+
+它只展示“达标推荐 / 探索候选 / 摘要级结构化输出”的格式和语义，不能代表真实检索质量。
+
+### 2. 在线生成一期速报
+
+复制配置并填入 DeepSeek API key：
+
+```bash
+cp .env.example .env
+# 编辑 .env：DEEPSEEK_API_KEY=...
+python graph.py
+```
+
+此命令会访问 arXiv 和 DeepSeek，也可能触发首次 FastEmbed 模型下载。它会在项目目录产生 `速报_YYYY-MM-DD.md`，并更新本地摘要库、去重集和成功水位。这是“运行一次”而非“每天自动运行”；如需周期执行，可由 cron / 任务调度平台外部触发。
+
+默认兴趣画像定义在 `retrieval.py` 的 `INTEREST`。首次运行后会成为本地 `profile.json` 的种子；已有 profile 时，应修改其 `interest` 字段而不是只改默认常量。
+
+### 3. 记录反馈
+
+```bash
+python feedback.py 1 up
+python feedback.py 2 down
+```
+
+序号只对应最近速报中达到 `7/10` 阈值的正式推荐。反馈会更新 liked/disliked 向量 anchor、当前标签和事件历史。
+
+当前 `PREF_WEIGHT = 0.0`：记录链路和重排实现已存在，但 3 个 anchor 不足以证明正权重能泛化，所以反馈暂不改变在线排序。积累更多可追溯标注后，应只在 dev 集选权重，再在 held-out test 评估一次：
+
+```bash
+python tune.py --seed 20260717 --weights 0,1,2,3,5,8
+```
+
+### 4. 摘要库问答
+
+```bash
+python qa.py "论文库里有哪些关于 Agent 记忆和混合检索的工作？"
+python qa.py "某个具体问题" --top-n 6
+```
+
+QA 会调用 DeepSeek 将问题补成英文检索 query，再复用 BM25 + 向量 + RRF 召回。模型最终只看通过相似度门槛的标题和摘要，回答必须引用有效编号；否则返回拒答信息。这是摘要库 RAG，不是 PDF 分块、全文索引或严格事实核查系统。
+
+## 评测与证据
+
+### 公开冻结快照
+
+[`eval_data/eval_v1.json`](eval_data/eval_v1.json) 冻结了评测输入、历史分数/理由和确定性 split；详细来源、schema 和限制见 [`eval_data/DATACARD.md`](eval_data/DATACARD.md)。
+
+| 字段 | 数量 / 语义 |
+|---|---|
+| 论文记录 | 210（标题 + arXiv 摘要） |
+| judged | 104：`rel=25`，`irrel=79` |
+| 未标注 | 106，不能默认当作负例 |
+| anchor | 3；优先隔离，避免偏好泄漏到调参/测试 |
+| split | `anchor=3`，`dev=72`，`test=30`，`unjudged=105` |
+| records SHA-256 | `9adc55b6d6ec5fec16a7947c2d90925a9bb8cffc54364e68234147406a0cf60a` |
+
+其中一条 anchor 没有历史标签，所以全局未标注数是 106，而 `unjudged` split 是 105。
+
+无 key、无私有源文件校验快照：
+
+```bash
+python scripts/export_eval_snapshot.py --verify-only
+```
+
+若本地保留导出时的 `papers_store.json` / `labels.json` / `profile.json` / legacy `scores_cache.json`，可检查它们能否精确重建已提交快照，不写文件：
+
+```bash
+python scripts/export_eval_snapshot.py --check
+```
+
+### 离线快照评测与当前在线评测
+
+```bash
+# 使用冻结 records / labels / splits / legacy score；不调 DeepSeek，默认 split=test
+python eval.py --snapshot eval_data/eval_v1.json
+
+# 需要时也可显式选择 test / dev / all
+python eval.py --snapshot eval_data/eval_v1.json --split test
+
+# 使用本地运行态、当前 Prompt/缓存，可能调 DeepSeek
+python eval.py
+```
+
+两者不可混为同一个结果：
+
+- 快照中的 `label` 是历史 **LLM-as-a-judge 银标签**，项目没有保存每条标签的人工复核人、时间和规则，因此不是人工金标。
+- 冻结 `score/reason` 是 legacy LLM 历史输出；旧缓存没有保留完整的模型、Prompt 和解析 schema 元数据，它不是当前打分 Prompt 的重放，也不调用 DeepSeek。
+- 默认 `test` 评测会从候选池移除 anchor 和 dev 记录，但保留 unjudged 论文作为真实检索干扰项；只用 test 标签计算指标。
+- 离线快照评测仍会运行 BM25 / FastEmbed / RRF，因此第一次可能下载 0.22–0.24 GB 向量模型。
+- 本地在线评测走与生产相同的 `RRF -> top-30 -> LLM` 漏斗，且当前缓存绑定模型、Prompt/schema 指纹、兴趣画像和论文内容；输入变化会安全失效并产生新的 API 调用。
+
+2026-07-17 的一次 `test` 参考运行见
+[`eval_data/eval_v1_reference.md`](eval_data/eval_v1_reference.md)。其中混合 RRF 的
+judged P@10 / R@10 / Coverage 为 `0.833 / 0.714 / 0.600`；加入冻结 legacy LLM
+分数后为 `1.000 / 0.571 / 0.400`。这说明 LLM 提高了低覆盖 top-10 的已判定纯度，
+但没有提高 judged Recall；因此项目不把单个 `1.000` 当作总体质量结论。
+
+两个评测入口均应报告：
+
+- `P@K (judged)`：top-K 中相关 judged 数 / top-K 中 judged 数；
+- `R@K (judged)`：top-K 中相关 judged 数 / 评测池中全部相关 judged 数；
+- `Coverage`：top-K 中 judged 占比；
+- 1000 次随机基线的均值/标准差，以及 LLM 阈值在已判定候选上的混淆矩阵、Balanced Accuracy 和 Cohen's kappa。
+
+未标注项不视为 `irrel`；任何高 Precision 都必须与 Coverage 一起解读。当前仓库只冻结输入、split 和 legacy 输出，**不将某次新模型指标宣称为已冻结结论**。
+
+如需增加人工标注，可先生成不展示模型分数/理由的随机盲核清单，再按序号写入标签：
+
+```bash
+python random_check.py 18 --seed 2026
+python label.py
+python label.py rel 1 5 8
+python label.py irrel 2 3 4
+```
+
+### Agent 决策专项评测
+
+排序评测只能证明检索/精排，不能证明 `reflect` 决策。项目另提供 12 个脱敏合成场景，
+覆盖分类过窄、兴趣过宽、已有近匹配、空候选、恶意标题、非法 action/category 和
+refocus query 校验：
+
+```bash
+# 默认读取人工编写的冻结 raw output：无 key、无网络、0 次模型调用
+DEEPSEEK_API_KEY= python agent_eval.py
+
+# 用当前 DeepSeek 替换冻结输出；每个场景进入一次 reflect policy
+python agent_eval.py --live
+```
+
+默认离线结果 action/constraint `12/12`、故障样本 fail-closed `4/4`，证明的是生产
+parser/validator/router 对固定 fixture 的契约，不是模型准确率。2026-07-17 的一次性
+DeepSeek A/B 最终在 8 个 policy 场景上得到：
+
+| 指标 | 最终在线结果 | 固定动作基线 |
+|---|---:|---:|
+| Action accuracy | 8/8 (100%) | always-widen 3/8；always-stop 3/8 |
+| Schema valid | 8/8 (100%) | — |
+| Constraint pass | 7/8 (87.5%) | — |
+
+唯一 constraint failure 来自一个本身有标签张力的 broad-query 场景，项目没有在看到输出后
+改标签凑满分。完整四轮 `4/8 -> 4/8 -> 7/8 -> 8/8` A/B、恶意标题修复过程、浮动模型
+版本和限制见
+[`agent_eval_data/live_reference_2026-07-17.md`](agent_eval_data/live_reference_2026-07-17.md)；
+数据卡见 [`agent_eval_data/DATACARD.md`](agent_eval_data/DATACARD.md)。这是 synthetic
+contract benchmark，不代表最终推荐收益、真实流量质量或统计显著性。
+
+## 目录结构
+
+| 路径 | 职责 |
+|---|---|
+| `graph.py` | LangGraph 节点、条件边、受控反思路由、速报组装与 demo |
+| `daily.py` | arXiv 时间窗口/分页抓取、水位与 DeepSeek 共享客户端 |
+| `retrieval.py` | FastEmbed / BM25 / RRF、top-30 漏斗、严格打分校验、缓存、偏好重排、摘要级速读 |
+| `memory.py` / `feedback.py` | 当前偏好、追加式事件、反馈 CLI 与评测 anchor |
+| `qa.py` | 本地摘要库、混合检索问答、相似度门槛与引用检查 |
+| `storage.py` | JSON/文本的原子替换与带文件锁更新 |
+| `eval.py` / `tune.py` | judged metrics、coverage、生产漏斗消融、确定性 dev/test 调参 |
+| `agent_eval.py` / `agent_eval_data/` | 反思动作合成情景、静态策略基线、fail-closed 契约与一次性在线 A/B |
+| `scripts/export_eval_snapshot.py` | 脱敏导出和校验冻结评测证据 |
+| `eval_data/` / `examples/` | 数据卡、冻结快照和摘要级速报样例 |
+| `test_*.py` / `.github/workflows/tests.yml` | 无 key 单元测试与 GitHub Actions CI |
+
+个人运行态（`.env`、profile、反馈、缓存、摘要库、seen/水位、速报）均由 `.gitignore` 排除，公开证据包不包含 API key 或个人兴趣文本。
+
+## 已知限制与后续工作
+
+- 只有标题和摘要，无法验证全文中的实验设置、数据集、数值结果或证明细节。
+- 104 条 judged 为银标签，且仅覆盖 210 条快照的一部分；需按预注册标注准则做双人独立复核，才能建立更可信的金标测试集。
+- 当前默认兴趣为代码/profile 配置，还没有多用户画像、Web 界面或鉴权。
+- 偏好重排的正权重尚未被 held-out 证据支持，因此默认关闭对排序的影响；这是有意的保守失败策略。
+- 在线运行依赖 arXiv、DeepSeek 和首次模型下载；当前没有服务化部署、指标监控或端到端调度。
+- Prompt 边界、schema 检查和白名单能降低风险，但不等于对 Prompt Injection 的形式化安全保证。
+- Agent 路由评测是 12 个开发者标注的 synthetic 场景；仍需真实运行日志、用户效用和成本/时延指标验证外部有效性。
+
+这个项目的重点不是把一次 LLM 调用包成“Agent”，而是把召回、决策、校验、降级、状态与评测口径放在同一个可测试工作流中。

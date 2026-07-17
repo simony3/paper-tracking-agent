@@ -1,6 +1,13 @@
 .venv/
 .env
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+.*.lock
+.*.tmp
 seen.json
+fetch_state.json
 profile.json
 last_top.json
 papers_store.json

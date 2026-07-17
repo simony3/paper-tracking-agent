@@ -1,18 +1,23 @@
-import sys
+import argparse
 
 from memory import load_last_top, record_feedback
 
-if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[2] not in ("up", "down"):
-        print("用法: python feedback.py <序号> up|down")
-        sys.exit(1)
-    idx = int(sys.argv[1]) - 1
-    label = sys.argv[2]
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="对最近一期速报中的论文记录偏好")
+    parser.add_argument("index", type=int, help="速报中的论文序号（从 1 开始）")
+    parser.add_argument("label", choices=("up", "down"), help="up=有用，down=没用")
+    args = parser.parse_args(argv)
+
+    idx = args.index - 1
     top = load_last_top()
     if not (0 <= idx < len(top)):
-        print(f"序号超范围,最近速报有 {len(top)} 篇")
-        sys.exit(1)
+        parser.error(f"序号超范围，最近速报有 {len(top)} 篇")
     paper = top[idx]
-    record_feedback(paper["id"], paper["title"], label, paper.get("summary", ""))
-    mark = "有用" if label == "up" else "没用"
+    record_feedback(paper["id"], paper["title"], args.label, paper.get("summary", ""))
+    mark = "有用" if args.label == "up" else "没用"
     print(f"已记录[{mark}]:{paper['title']}")
+
+
+if __name__ == "__main__":
+    main()
